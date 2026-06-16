@@ -2,18 +2,10 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import re
+import pickle
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
-from sklearn.naive_bayes import MultinomialNB
-from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.metrics import f1_score, silhouette_score
-from sklearn.cluster import KMeans
-from sklearn.decomposition import PCA
-from imblearn.over_sampling import SMOTE
 from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
 from Sastrawi.StopWordRemover.StopWordRemoverFactory import StopWordRemoverFactory
 import warnings
@@ -127,146 +119,28 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-@st.cache_resource(show_spinner="Memuat dan melatih model... (hanya sekali saat pertama kali)")
-def load_and_train():
-    df = pd.read_csv('Panduan Tubes/tourist_reviews.csv')
+@st.cache_resource(show_spinner="Memuat model dan data...")
+def load_app_data():
+    """Memuat data dan model yang sudah di-train dari file pickle."""
+    with open('models/app_data.pkl', 'rb') as f:
+        app_data = f.read()
+    data = pickle.loads(app_data)
 
-    target_cols = ['accessibility', 'facility', 'activity']
-
-    df_clean = df.copy()
-    df_clean = df_clean.drop_duplicates()
-    df_clean = df_clean.dropna(subset=['text'] + target_cols)
-
-    df_clean['text_clean'] = df_clean['text'].astype(str).str.lower()
-
-    def clean_text(text):
-        text = re.sub(r'http\S+|www\.\S+', '', text)
-        text = re.sub(r'@\w+', '', text)
-        text = re.sub(r'#\w+', '', text)
-        text = re.sub(r'[^\w\s]', '', text)
-        text = re.sub(r'\d+', '', text)
-        text = re.sub(r'\s+', ' ', text).strip()
-        return text
-
-    df_clean['text_clean'] = df_clean['text_clean'].apply(clean_text)
-
+    # Buat stemmer dan stopwords untuk prediksi real-time
+    # (ringan, hanya membuat objek — tidak memproses seluruh dataset)
     stop_factory = StopWordRemoverFactory()
     stopwords_list = stop_factory.get_stop_words()
 
-    def remove_stopwords(text):
-        words = text.split()
-        filtered = [w for w in words if w not in stopwords_list]
-        return ' '.join(filtered)
-
-    df_clean['text_clean'] = df_clean['text_clean'].apply(remove_stopwords)
-
     stem_factory = StemmerFactory()
     stemmer = stem_factory.create_stemmer()
-    df_clean['text_clean'] = df_clean['text_clean'].apply(lambda x: stemmer.stem(x))
 
-    df_clean = df_clean[df_clean['text_clean'].str.strip().astype(bool)]
+    data['stemmer'] = stemmer
+    data['stopwords_list'] = stopwords_list
 
-    label_encoders = {}
-    for col in target_cols:
-        le = LabelEncoder()
-        df_clean[f'{col}_encoded'] = le.fit_transform(df_clean[col])
-        label_encoders[col] = le
-
-    tfidf_vectorizer = TfidfVectorizer(max_features=5000)
-    X_tfidf = tfidf_vectorizer.fit_transform(df_clean['text_clean'])
-
-    smote = SMOTE(random_state=42)
-    final_models = {}
-
-    for col in target_cols:
-        y = df_clean[f'{col}_encoded'].values
-        X_res, y_res = smote.fit_resample(X_tfidf, y)
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_res, y_res, test_size=0.2, random_state=42, stratify=y_res
-        )
-
-        lr_grid = GridSearchCV(
-            LogisticRegression(max_iter=1000, random_state=42),
-            {'C': [0.01, 0.1, 1, 10, 100], 'solver': ['lbfgs', 'liblinear'], 'penalty': ['l2']},
-            cv=5, scoring='f1_weighted', n_jobs=-1, verbose=0
-        )
-        lr_grid.fit(X_train, y_train)
-        lr_f1 = f1_score(y_test, lr_grid.best_estimator_.predict(X_test), average='weighted')
-
-        nb_grid = GridSearchCV(
-            MultinomialNB(),
-            {'alpha': [0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0]},
-            cv=5, scoring='f1_weighted', n_jobs=-1, verbose=0
-        )
-        nb_grid.fit(X_train, y_train)
-        nb_f1 = f1_score(y_test, nb_grid.best_estimator_.predict(X_test), average='weighted')
-
-        if lr_f1 >= nb_f1:
-            final_models[col] = {'model': lr_grid.best_estimator_, 'name': 'Logistic Regression', 'f1': lr_f1}
-        else:
-            final_models[col] = {'model': nb_grid.best_estimator_, 'name': 'Naïve Bayes', 'f1': nb_f1}
-
-    for col in target_cols:
-        y_pred = final_models[col]['model'].predict(X_tfidf)
-        df_clean[f'{col}_pred'] = label_encoders[col].inverse_transform(y_pred)
-
-    sentiment_labels = ['positive', 'negative', 'neutral']
-    agg_data = []
-    for location in df_clean['location'].unique():
-        loc_data = df_clean[df_clean['location'] == location]
-        total = len(loc_data)
-        row = {'location': location, 'total_reviews': total}
-        for col in target_cols:
-            for sentiment in sentiment_labels:
-                count = (loc_data[f'{col}_pred'] == sentiment).sum()
-                row[f'{col}_{sentiment}_pct'] = count / total * 100
-        agg_data.append(row)
-
-    df_location = pd.DataFrame(agg_data).sort_values('total_reviews', ascending=False).reset_index(drop=True)
-
-    feature_cols = [c for c in df_location.columns if '_pct' in c]
-    X_cluster = df_location[feature_cols].values
-    scaler = StandardScaler()
-    X_cluster_scaled = scaler.fit_transform(X_cluster)
-
-    max_k = min(10, len(df_location) - 1)
-    K_range = range(2, max_k + 1)
-    sil_scores = []
-    inertias = []
-    for k in K_range:
-        km = KMeans(n_clusters=k, random_state=42, n_init=10)
-        km.fit(X_cluster_scaled)
-        inertias.append(km.inertia_)
-        sil_scores.append(silhouette_score(X_cluster_scaled, km.labels_))
-
-    best_k = list(K_range)[np.argmax(sil_scores)]
-
-    kmeans_final = KMeans(n_clusters=best_k, random_state=42, n_init=10)
-    df_location['cluster'] = kmeans_final.fit_predict(X_cluster_scaled)
-
-    pca = PCA(n_components=2, random_state=42)
-    coords = pca.fit_transform(X_cluster_scaled)
-    df_location['pca_x'] = coords[:, 0]
-    df_location['pca_y'] = coords[:, 1]
-
-    return {
-        'df_clean': df_clean,
-        'df_location': df_location,
-        'final_models': final_models,
-        'label_encoders': label_encoders,
-        'tfidf_vectorizer': tfidf_vectorizer,
-        'stemmer': stemmer,
-        'stopwords_list': stopwords_list,
-        'target_cols': target_cols,
-        'best_k': best_k,
-        'inertias': inertias,
-        'sil_scores': sil_scores,
-        'K_range': list(K_range),
-        'feature_cols': feature_cols
-    }
+    return data
 
 
-data = load_and_train()
+data = load_app_data()
 
 df_clean = data['df_clean']
 df_location = data['df_location']
