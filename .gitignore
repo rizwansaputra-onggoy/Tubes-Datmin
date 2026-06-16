@@ -4,4 +4,5 @@ __pycache__/
 .DS_Store
 .ipynb_checkpoints/
 .streamlit/
+*.docx
 train_model.py
